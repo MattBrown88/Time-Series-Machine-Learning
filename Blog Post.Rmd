@@ -1,0 +1,335 @@
+---
+title: "Time Series Forecasting with Machine Learning: An example from Kaggle"
+author: "Matt Brown"
+date: "1/11/2018"
+output: html_document
+---
+
+# Introduction
+
+In this post, we will demonstrate how to use machine learning to forecast time series data. The data set is from a recent [Kaggle competition](https://www.kaggle.com/c/favorita-grocery-sales-forecasting) to predict retail sales.
+
+In this post, you will learn how to:
+
+* Build a machine learning model to forecast time series data (data cleansing, feature engineering and modeling)
+* Perform feature engineering to build categorical and continuous temporal features
+* Identify and plot feature importance
+* Utilize a recursive prediction technique for long-term time series forecasting
+
+## Time Series Forecasting
+
+Time series forecasting using machine learning is more complex than standard machine learning because the temporal component of the data adds an extra dimension to the problem. Time series forecasting is used across almost all industries. A few examples are:
+
+* Retail Product Sales
+* Stock Price Movement
+* Agricultural Yields
+* Utilization of Resources
+* Service Queues
+
+Time series forecasts can be either short-term (e.g. predict tomorrow's sales) or long-term (e.g. predict sales for the next month). Long-term predictions are more complex because uncertainty increases with the length of the predictive period. The problem we analyze in this post requires long-term predictions. We will use a recursive prediction technique which we will discuss in greater detail later in the post. 
+
+## Data Overview
+
+**Competition Description:** Corporación Favorita, a large Ecuadorian-based grocery retailer that operates hundreds of supermarkets, with over 200,000 different products on their shelves, has challenged the Kaggle community to build a model that more accurately forecasts product sales.
+
+**Dataset:** Corporacion Favorita provided historical sales data from 2012 - August 15th, 2017. 
+
+**Challenge:** The challenge is to predict sales from August 16th - August 31st 2017 for a given product at a given store.
+
+# Load packages
+``` {r, results = 'hide', echo = TRUE, message = FALSE}
+library(data.table)
+library(dplyr)
+library(padr)
+library(xgboost)
+library(Matrix)
+library(RcppRoll)
+library(zoo)
+```
+
+# Data Cleansing 
+
+To speed up the analysis, we will use data from four stores from the dates 2017-07-15 to 2017-08-15, and a subset of the available features.
+
+At the start of any data science problem, it is important to explore the available data. The *head()*, *str()* and *summary()* functions are great for getting a high-level view of the data.
+
+Read and subset test and training data.
+``` {r, message = FALSE, results = 'hide'}
+#Read in training dataset
+train_full <- fread('./input/train.csv')
+stores <- c(1,2,3,21)
+MinDate <- '2017-07-15'
+MaxDate <- '2017-08-15'
+
+#Read in test dataset
+test <- fread('./input/test.csv')
+test <- test[test$store_nbr %in% stores ,]
+
+train <- train_full[train_full$date >= MinDate,]
+train <- train[train$store_nbr %in% stores,]
+```
+
+View the first few rows of the data set.
+``` {r}
+head(train)
+```
+
+With these few columns we will be able to create many new temporal features for the model.
+
+View the structure of the data set.
+``` {r}
+str(train)
+```
+
+View a summary of the target feature (the feature we will be predicting).
+``` {r}
+summary(train$unit_sales)
+```
+
+The summary of unit_sales shows there are days with negative sales. Below we calculate there are only 24 days with negative unit_sales in the subset of data we chose. This is rare enough that we will just remove these days.
+
+``` {r}
+length(train$unit_sales[train$unit_sales < 0])
+train$unit_sales[train$unit_sales < 0] <- 0 #Remove negative sales day.
+```
+# Data Cleansing
+
+The evaluation metric of the competition is LRMSE (Log Root Mean Squared Error). The reason for using this metric is to scale the impact of inaccurate predictions. Using the log penalizes predicting 1 when the actual is 6 more than predicting 40 when the actual is 45. We convert unit_sales to log unit_sales here.
+
+``` {r, results = 'hide'}
+train$unit_sales <- log1p(train$unit_sales) #Convert to log
+```
+
+## Data Consistency
+
+In this problem, the training and test data sets were not in the same format. In the test data set there were entries for items which had zero unit_sales at a given store for a given day. The training data set only contained items on days in which there were unit_sales (i.e. there are no zero unit_sales entries). The training data set needs to include entries for items that were available at a given store on a given day but didn't record any unit_sales.
+
+To demonstrate the missing entries from the training data set, here's an example of the original data set subset for a single store and item. Notice how there are no unit_sales from 2017-08-05 to 2017-08-07. We will create new rows for these missing entries and add zero for unit_sales using the *padr* package.
+
+``` {r}
+train_example <- train[train$store_nbr == 1 & train$item_nbr == 103520 & train$date > '2017-08-01',]
+train_example[,c('date', 'unit_sales', 'store_nbr', 'item_nbr')]
+```
+
+*Padr* requires the data set have a Date data type field so we convert train$date . The start_val and end_val specify the range from which to add zeros grouped by store_nbr and item_nbr. We only want to add zeros for the range of dates we selected to build the model. 
+
+``` {r}
+train$date <- as.Date(train$date) #Convert to date data type
+
+train <- pad(train, start_val = as.Date(MinDate)
+             , end_val = as.Date(MaxDate), interval = 'day'
+             , group = c('store_nbr', 'item_nbr'), break_above = 100000000000
+) %>%
+  fill_by_value(unit_sales) #Adds zeros to the dataframe. Adds NAs without this argument.
+
+```
+
+The updated data set is shown below. Notice the new zero unit_sales rows added to the data set.
+``` {r}
+train_updated <- train[train$store_nbr == 1 & train$item_nbr == 103520 & train$date > '2017-08-01',]
+train_updated[,c('date', 'unit_sales', 'store_nbr', 'item_nbr')]
+```
+
+The training data set now matches the format of the test data set which is necessary for any chance at an accurate model.
+
+Next, we combine the test and training data sets since we will perform some of the same feature engineering steps on each. We do not want to duplicate code since any extra steps increase the likelihood of mistakes. The fill argument is required because the test and training data sets don't have the same columns; it will fill the test portion of unit_sales with NAs.
+
+``` {r}
+train$date <- as.character(train$date) #Convert so train and test data structures match
+df <- rbind(train, test, fill = TRUE)
+```
+
+# Feature Engineering
+
+Machine learning models cannot simply 'understand' temporal data so we much explicitly create time-based features. Here we create the temporal features day of week, calendar date, month and year from the date field using the *substr* function. These new features can be helpful in identifying cyclical sales patterns.
+
+We convert all of these features to numeric because that is the format required for the machine learning algorithm we will use. 
+``` {r}
+#Create and Modify variables
+df$month <- as.numeric(substr(df$date, 6, 7))
+df$day <- as.numeric(as.factor(weekdays(as.Date(df$date)))) #day of week
+df$day_num <- as.numeric(substr(df$date, 9, 10))
+df$year <- substr(df$date, 1, 4)
+```
+
+We separate the training set from the test set now that we have completed the feature engineering which we will do to both. 
+``` {r}
+train <- subset(df, date < '2017-08-16')
+```
+
+Now we will create lag and sliding window variables using the *RcppRoll* package. These features are the heart of the model and will have the most influence on it's accuracy. We cannot yet create these features for the test data set because the required data is missing.
+
+Before creating these new features, we must order the data set by date so the lag value is the previous date. There are a wide variety of statistical features we could create here. Here we will create three new features using the unit_sales column: lag_1 (1-day lag), avg_3 (3-day rolling mean) and avg_7 (7-day rolling mean). 
+
+Some examples of other features we could create are rolling median / max / min / sd. We could also modify the sliding window timeframe (e.g. 15 days, 30 days, 90 days, etc). When building a machine learning model, it is best to try many different engineered features and test how beneficial they are to the accuracy of the model.
+
+``` {r}
+train <- train[order(train$date),]
+
+train <- train %>%
+  group_by(store_nbr, item_nbr) %>%
+  mutate(lag_1 = lag(unit_sales, 1)
+         , avg_7 = lag(roll_meanr(unit_sales, 7), 1)
+         , avg_3 = lag(roll_meanr(unit_sales, 3), 1)
+         )
+
+train_example <- train[train$store_nbr == 1 & train$item_nbr == 103520,]
+train_example$date <- as.character(train_example$date)
+train_example[,c('date', 'unit_sales', 'avg_3', 'avg_7', 'lag_1', 'store_nbr', 'item_nbr')]
+```
+
+We need to remove the rows where avg_7, avg_3 and lag_1 are NA because values in these fields are required for the model. Removing the NAs in avg_7 accomplishes this because of overlap between the NA values across the features. We now have the following features in the data set.
+``` {r}
+train <- train[!is.na(train$avg_7),]
+colnames(train)
+```
+
+# Modeling
+
+Machine learning algorithms require the data to be in a specific format. To train the model, there must be a vector of true values (called the target or label) and a matrix of features. We use the *sparse.model.matrix* function from the *Matrix* package to build a matrix of predictive features. For this model, we will use the features avg_3, avg_7, lag_1, day and onpromotion. The contrasts.arg argument specifies the features which are categorical rather than continuous.
+
+**Note:** One-hot encoding is a common technique to handle categorical variables when building statistical models. However it is not strictly required when building a tree-based models. [Here](https://www.kaggle.com/c/grupo-bimbo-inventory-demand/discussion/22153) is a solid discussion of encoding for machine learning models.
+
+``` {r}
+label <- train$unit_sales
+
+#Returns object unchanged if there are NA values
+previous_na_action<- options('na.action')
+options(na.action='na.pass')
+
+#Build matrix input for the model
+trainMatrix <- sparse.model.matrix(~ avg_3 + avg_7 + lag_1 + day + onpromotion 
+                                   , data = train
+                                   , contrasts.arg = c('day', 'onpromotion')
+                                   , sparse = FALSE, sci = FALSE)
+
+options(na.action = previous_na_action$na.action)
+
+```
+
+We will use the package *xgboost* to build the model. *Xgboost* requires the data be in the *xgb.DMatrix* format which accepts matrices for the data argument.
+``` {r}
+#Create input for xgboost
+trainDMatrix <- xgb.DMatrix(data = trainMatrix, label = label)
+```
+
+We specify model parameters with a list. Here we only specify the basic parameters of xgboost. There are many excellent tutorials on parameter tuning. My favorite is [this one at analyticsvidhya.com](https://www.analyticsvidhya.com/blog/2016/02/complete-guide-parameter-tuning-gradient-boosting-gbm-python/).
+
+``` {r}
+#Set parameters of model
+params <- list(booster = "gbtree"
+               , objective = "reg:linear"
+               , eta=0.4
+               , gamma=0
+               )
+```
+
+Cross-validation decreases the likelihood of over-fitting and is used to determine the number of iterations to run when building the model.
+``` {r}
+#Cross-validation
+xgb.tab <- xgb.cv(data = trainDMatrix
+                  , param = params
+                  , maximize = FALSE, evaluation = "rmse", nrounds = 100
+                  , nthreads = 10, nfold = 2, early_stopping_round = 10)
+
+```
+
+Here we build the model to predict unit_sales.
+``` {r}
+#Number of rounds
+num_iterations = xgb.tab$best_iteration
+
+model <- xgb.train(data = trainDMatrix
+                               , param = params
+                               , maximize = FALSE, evaluation = 'rmse', nrounds = num_iterations)
+```
+
+Xgb.importance shows how influential each feature was in building the model. This function helps us identify unnecessary features.
+
+## Feature Importance Plot
+``` {r}
+importance <- xgb.importance(feature_names = colnames(trainMatrix), model = model)
+xgb.ggplot.importance(importance_matrix = importance)
+```
+
+## Recursive Forecasting
+
+One of the difficulties in this problem is we must predict sales for the next fifteen days. The current data set only has the lag and rolling mean values for the first day we must predict (2017-08-16). To predict for the entire test data set, we must recursively add the predictions to the test data set then use the updated data set to predict for the next day. One issue is that errors will propagate through the model which can decrease the accuracy of longer-term predictions.
+
+In this for loop, we perform many of the same operations to the test data set as we did to the training data set in previous steps. If you do not understand any of the code below, look back through this post to see if that particular action was described previously.
+
+``` {r}
+#Dates vector for the testing dataset
+Dates <- seq.Date(from = as.Date('2017-08-16'), by = 'day', to = as.Date('2017-08-30' ))
+
+df_test <- df
+i=1
+for (i in 1:length(Dates)){
+
+  #Order test dataset
+  df_test <- df_test[order(df_test$date),]
+  
+  #Create lag variables on the testing data
+  df_test <- df_test %>%
+    group_by(store_nbr, item_nbr) %>%
+    mutate(lag_1 = lag(unit_sales, 1)
+         , avg_7 = lag(roll_meanr(unit_sales, 7), 1)
+         , avg_3 = lag(roll_meanr(unit_sales, 3), 1)
+         )
+  
+  #Subset testing data to predict only 1 day at a time
+  test <- df_test[df_test$date == as.character(Dates[i]),]
+  
+  #Remove NAs
+  test <- test[!is.na(test$id),]
+  test <- test[!is.na(test$avg_7),]
+  
+  #Create test matrix to build predictions
+  previous_na_action<- options('na.action')
+  options(na.action='na.pass')
+  
+  testMatrix <- sparse.model.matrix(~ avg_3 + avg_7 + lag_1 + day + onpromotion 
+                                   , data = test
+                                   , contrasts.arg = c('day', 'onpromotion')
+                                    , sparse = FALSE, sci = FALSE)
+  
+  
+  options(na.action = previous_na_action$na.action)
+  
+  #Predict values for a given day
+  pred <- predict(model, testMatrix)
+
+  #Set predictions that are less than zero to zero
+  pred[pred < 0] <- 0
+
+  #Add predicted values to the data set based on ids
+  df_test$unit_sales[df_test$id %in% test$id] <- pred
+  
+  print(i)
+  gc()
+  
+}
+```
+
+
+Here we subset the data to only include the days we predicted. We predict zero unit_sales for any NA values, convert the predictions from their log using the *expm1()* function and write the predictions to a csv file.
+``` {r}
+#Only include the testing dates
+df_test <- df_test[df_test$date >= '2017-08-16',]
+
+#Set NA values to zero
+df_test$unit_sales[is.na(df_test$unit_sales)] <- 0
+
+#Convert predictions back to normal unit from the log.
+df_test$unit_sales <- expm1(df_test$unit_sales)
+
+#Create solution dataset
+solution <- df_test[,c('id', 'unit_sales')]
+
+#Write solution csv
+write.csv(solution, 'solution.csv', row.names = FALSE)
+
+```
+
+I hope after completing this post you are able to build your own time series forecasting models. Please comment / share if you liked this post and feel free to contact me if you have any questions matt@redoakstrategic.com
+
